@@ -13,6 +13,10 @@ function enhanceNotifications() {
     
     // Store the last fetched search cursor for pagination
     let lastSearchAfter = null;
+    
+    // Retry configuration
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY = 2000; // 2 seconds
   
     // Function to observe DOM changes and detect the notification popup or changes in the alarm page
     function observeDOM() {
@@ -103,16 +107,21 @@ function enhanceNotifications() {
       } catch (e) {
         console.log('Could not access localStorage');
       }
-  
+
       return { csrfToken, xToken };
     }
+
+    // Function to sleep/wait
+    function sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
   
-    // Function to mark a notification as read
-    async function markAsRead(notificationId) {
+    // Function to mark a notification as read with retry logic
+    async function markAsRead(notificationId, retryCount = 0) {
       try {
         const { csrfToken, xToken } = extractTokens();
         
-        await fetch("https://playentry.org/graphql/READ_TOPIC", {
+        const response = await fetch("https://playentry.org/graphql/READ_TOPIC", {
           "headers": {
             "accept": "*/*",
             "content-type": "application/json",
@@ -138,17 +147,31 @@ function enhanceNotifications() {
           "credentials": "include"
         });
         
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
         console.log(`Marked notification ${notificationId} as read`);
+        return true;
       } catch (error) {
-        console.log('Error marking notification as read:', error);
+        console.log(`Error marking notification as read (attempt ${retryCount + 1}):`, error);
+        
+        if (retryCount < MAX_RETRIES) {
+          console.log(`Retrying in ${RETRY_DELAY}ms...`);
+          await sleep(RETRY_DELAY);
+          return markAsRead(notificationId, retryCount + 1);
+        }
+        
+        console.log(`Failed to mark notification ${notificationId} as read after ${MAX_RETRIES} attempts`);
+        return false;
       }
     }
   
-    // Function to fetch notifications data from GraphQL API
-    async function fetchNotificationData(searchAfter = null) {
+    // Function to fetch notifications data from GraphQL API with retry logic
+    async function fetchNotificationData(searchAfter = null, retryCount = 0) {
       try {
         const { csrfToken, xToken } = extractTokens();
-  
+
         const variables = {
           pageParam: {
             display: 20
@@ -159,7 +182,7 @@ function enhanceNotifications() {
         if (searchAfter) {
           variables.searchAfter = searchAfter;
         }
-  
+
         const response = await fetch("https://playentry.org/graphql/SELECT_TOPICS", {
           "headers": {
             "accept": "*/*",
@@ -203,7 +226,11 @@ function enhanceNotifications() {
           "mode": "cors",
           "credentials": "include"
         });
-  
+
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
         const data = await response.json();
         
         if (data && data.data && data.data.topicList) {
@@ -211,11 +238,45 @@ function enhanceNotifications() {
           return data.data.topicList.list;
         }
         
-        return [];
+        throw new Error('Invalid response structure');
       } catch (error) {
-        console.log('Error fetching notifications data:', error);
+        console.log(`Error fetching notifications data (attempt ${retryCount + 1}):`, error);
+        
+        if (retryCount < MAX_RETRIES) {
+          console.log(`Retrying in ${RETRY_DELAY}ms...`);
+          await sleep(RETRY_DELAY);
+          return fetchNotificationData(searchAfter, retryCount + 1);
+        }
+        
+        console.log(`Failed to fetch notifications after ${MAX_RETRIES} attempts`);
         return [];
       }
+    }
+
+    // Function to determine the target URL for a notification
+    function getNotificationTargetUrl(notification) {
+      if (!notification.link) {
+        return null;
+      }
+
+      // Check if link.target contains a full URL (특별한 경우 처리)
+      if (notification.link.target && notification.link.target.startsWith('http')) {
+        return notification.link.target;
+      }
+
+      // Handle specific categories
+      if (notification.link.category === 'free') {
+        return `https://playentry.org/community/entrystory/${notification.link.target}`;
+      } else if (notification.link.category === 'suggestion') {
+        return `https://playentry.org/suggestion/${notification.link.target}`;
+      } else if (notification.link.category === 'etc' && notification.link.target) {
+        // etc 카테고리에서도 전체 URL이 올 수 있음
+        if (notification.link.target.startsWith('http')) {
+          return notification.link.target;
+        }
+      }
+
+      return null;
     }
   
     // Function to fetch notifications and enhance the popup on regular pages
@@ -226,27 +287,19 @@ function enhanceNotifications() {
         if (!notificationContainer) {
           return;
         }
-  
+
         const notificationItems = notificationContainer.querySelectorAll('li');
         if (!notificationItems.length) {
           return;
         }
-  
-        // First, add a direct click handler to each notification item
-        // This will send them to the free board as a fallback in case API call fails
+
+        // Remove fallback click handlers - don't set default redirect behavior
         for (const item of notificationItems) {
-          item.style.cursor = 'pointer';
-          item.onclick = function(event) {
-            // Don't interfere with existing click behavior
-            if (event.target.tagName === 'A' || event.target.closest('a')) {
-              return;
-            }
-            
-            // Default fallback action - go to community main
-            window.location.href = 'https://playentry.org/community/free';
-          };
+          // Reset any previous handlers and just set cursor
+          item.style.cursor = 'default';
+          item.onclick = null;
         }
-  
+
         // Fetch notification data
         const notifications = await fetchNotificationData();
         
@@ -260,8 +313,13 @@ function enhanceNotifications() {
             // Store the notification ID in a data attribute for easy access
             item.dataset.notificationId = notification.id;
             
-            // Set up click handler for free or suggestion category notifications
-            if (notification.link && (notification.link.category === 'free' || notification.link.category === 'suggestion')) {
+            // Get target URL for this notification
+            const targetUrl = getNotificationTargetUrl(notification);
+            
+            if (targetUrl) {
+              // Set cursor to pointer only if we have a valid target
+              item.style.cursor = 'pointer';
+              
               item.onclick = async function(event) {
                 // Don't interfere with existing click behavior
                 if (event.target.tagName === 'A' || event.target.closest('a')) {
@@ -271,24 +329,20 @@ function enhanceNotifications() {
                 // Prevent default behavior
                 event.preventDefault();
                 
-                // Mark as read
-                await markAsRead(notification.id);
+                // Mark as read (non-blocking)
+                markAsRead(notification.id);
                 
-                // Go to the appropriate page based on category
-                let targetUrl;
-                if (notification.link.category === 'free') {
-                  targetUrl = `https://playentry.org/community/entrystory/${notification.link.target}`;
-                } else if (notification.link.category === 'suggestion') {
-                  targetUrl = `https://playentry.org/suggestion/${notification.link.target}`;
-                }
-                
+                // Navigate to target URL
                 window.location.href = targetUrl;
               };
             }
           }
+        } else {
+          console.log('No notification data available - keeping items non-clickable');
         }
       } catch (error) {
         console.log('Error enhancing notification popup:', error);
+        // Don't provide fallback navigation on error
       }
     }
   
@@ -299,20 +353,20 @@ function enhanceNotifications() {
         if (!isAlarmPage()) {
           return;
         }
-  
+
         // Get all notification items from the DOM
         const notificationContainer = document.querySelector('dl.css-1vvesx9');
         if (!notificationContainer) {
           return;
         }
-  
+
         const notificationItems = notificationContainer.querySelectorAll('dd');
         if (!notificationItems.length) {
           return;
         }
-  
+
         console.log(`Found ${notificationItems.length} notification items on alarm page`);
-  
+
         // Get only the items that haven't been enhanced yet
         const unenhancedItems = Array.from(notificationItems).filter(item => !item.hasAttribute('data-enhanced'));
         
@@ -321,7 +375,7 @@ function enhanceNotifications() {
         }
         
         console.log(`Enhancing ${unenhancedItems.length} new notification items`);
-  
+
         // Fetch notification data
         const notifications = await fetchNotificationData(lastSearchAfter);
         
@@ -341,9 +395,11 @@ function enhanceNotifications() {
             const mainDiv = item.querySelector('div.css-1gx654b, div.css-1rrteue');
             if (!mainDiv) continue;
             
-            // Set up click handler for free or suggestion category notifications
-            if (notification.link && (notification.link.category === 'free' || notification.link.category === 'suggestion')) {
-              // Set cursor to pointer
+            // Get target URL for this notification
+            const targetUrl = getNotificationTargetUrl(notification);
+            
+            if (targetUrl) {
+              // Set cursor to pointer only if we have a valid target
               mainDiv.style.cursor = 'pointer';
               
               mainDiv.onclick = async function(event) {
@@ -355,24 +411,24 @@ function enhanceNotifications() {
                 // Prevent default behavior
                 event.preventDefault();
                 
-                // Mark as read
-                await markAsRead(notification.id);
+                // Mark as read (non-blocking)
+                markAsRead(notification.id);
                 
-                // Go to the appropriate page based on category
-                let targetUrl;
-                if (notification.link.category === 'free') {
-                  targetUrl = `https://playentry.org/community/entrystory/${notification.link.target}`;
-                } else if (notification.link.category === 'suggestion') {
-                  targetUrl = `https://playentry.org/suggestion/${notification.link.target}`;
-                }
-                
+                // Navigate to target URL
                 window.location.href = targetUrl;
               };
             }
           }
+        } else {
+          console.log('No notification data available - marking items as enhanced but keeping non-clickable');
+          // Mark items as enhanced even if no data, to avoid infinite retries
+          for (const item of unenhancedItems) {
+            item.setAttribute('data-enhanced', 'true');
+          }
         }
       } catch (error) {
         console.log('Error enhancing alarm page:', error);
+        // Don't provide fallback navigation on error
       }
     }
   
