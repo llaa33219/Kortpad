@@ -11,8 +11,8 @@ function enhanceNotifications() {
     // Check if we're on the alarm page
     const isAlarmPage = () => window.location.href.includes('/alarm');
     
-    // Store the last fetched search cursor for pagination
-    let lastSearchAfter = null;
+    // Prevent concurrent fetches
+    let isFetching = false;
     
     // Retry configuration
     const MAX_RETRIES = 3;
@@ -28,6 +28,9 @@ function enhanceNotifications() {
         if (currentUrl !== window.location.href) {
           currentUrl = window.location.href;
           console.log('URL changed to:', currentUrl);
+          
+          // Reset fetch state when URL changes
+          isFetching = false;
           
           // If we're now on the alarm page, enhance it
           if (isAlarmPage()) {
@@ -168,20 +171,15 @@ function enhanceNotifications() {
     }
   
     // Function to fetch notifications data from GraphQL API with retry logic
-    async function fetchNotificationData(searchAfter = null, retryCount = 0) {
+    async function fetchNotificationData(displayCount = 20, retryCount = 0) {
       try {
         const { csrfToken, xToken } = extractTokens();
 
         const variables = {
           pageParam: {
-            display: 20
+            display: displayCount
           }
         };
-        
-        // Add searchAfter if we have one for pagination
-        if (searchAfter) {
-          variables.searchAfter = searchAfter;
-        }
 
         const response = await fetch("https://playentry.org/graphql/SELECT_TOPICS", {
           "headers": {
@@ -193,9 +191,8 @@ function enhanceNotifications() {
           },
           "body": JSON.stringify({
             query: `
-              query SELECT_TOPICS($pageParam: PageParam, $searchAfter: JSON){
-                topicList(pageParam: $pageParam, searchAfter: $searchAfter) {
-                  searchAfter
+              query SELECT_TOPICS($pageParam: PageParam){
+                topicList(pageParam: $pageParam) {
                   list {
                     id
                     params
@@ -234,7 +231,6 @@ function enhanceNotifications() {
         const data = await response.json();
         
         if (data && data.data && data.data.topicList) {
-          lastSearchAfter = data.data.topicList.searchAfter;
           return data.data.topicList.list;
         }
         
@@ -245,7 +241,7 @@ function enhanceNotifications() {
         if (retryCount < MAX_RETRIES) {
           console.log(`Retrying in ${RETRY_DELAY}ms...`);
           await sleep(RETRY_DELAY);
-          return fetchNotificationData(searchAfter, retryCount + 1);
+          return fetchNotificationData(displayCount, retryCount + 1);
         }
         
         console.log(`Failed to fetch notifications after ${MAX_RETRIES} attempts`);
@@ -295,8 +291,7 @@ function enhanceNotifications() {
 
         // Remove fallback click handlers - don't set default redirect behavior
         for (const item of notificationItems) {
-          // Reset any previous handlers and just set cursor
-          item.style.cursor = 'default';
+          // Reset any previous handlers
           item.onclick = null;
         }
 
@@ -354,6 +349,11 @@ function enhanceNotifications() {
           return;
         }
 
+        // Prevent concurrent fetches
+        if (isFetching) {
+          return;
+        }
+
         // Get all notification items from the DOM
         const notificationContainer = document.querySelector('dl.css-1vvesx9');
         if (!notificationContainer) {
@@ -376,59 +376,77 @@ function enhanceNotifications() {
         
         console.log(`Enhancing ${unenhancedItems.length} new notification items`);
 
-        // Fetch notification data
-        const notifications = await fetchNotificationData(lastSearchAfter);
-        
-        if (notifications.length > 0) {
-          // Associate each unenhanced HTML notification item with notifications
-          for (let i = 0; i < Math.min(unenhancedItems.length, notifications.length); i++) {
-            const notification = notifications[i];
+        isFetching = true;
+        try {
+          // Fetch notification data for all items in DOM
+          const totalItems = notificationItems.length;
+          const notifications = await fetchNotificationData(totalItems);
+          
+          console.log(`Fetched ${notifications.length} notifications for ${totalItems} DOM items`);
+
+          // Enhance all unenhanced items
+          for (let i = 0; i < unenhancedItems.length; i++) {
             const item = unenhancedItems[i];
             
-            // Mark this item as enhanced
-            item.setAttribute('data-enhanced', 'true');
+            // Find the index of this item in the full notificationItems list
+            const itemIndex = Array.from(notificationItems).indexOf(item);
             
-            // Store the notification ID in a data attribute for easy access
-            item.dataset.notificationId = notification.id;
-            
-            // Get the main div element inside dd
-            const mainDiv = item.querySelector('div.css-1gx654b, div.css-1rrteue');
-            if (!mainDiv) continue;
-            
-            // Get target URL for this notification
-            const targetUrl = getNotificationTargetUrl(notification);
-            
-            if (targetUrl) {
-              // Set cursor to pointer only if we have a valid target
-              mainDiv.style.cursor = 'pointer';
+            if (itemIndex >= 0 && itemIndex < notifications.length) {
+              const notification = notifications[itemIndex];
               
-              mainDiv.onclick = async function(event) {
-                // Don't interfere with existing click behavior
-                if (event.target.tagName === 'A' || event.target.closest('a')) {
-                  return;
-                }
+              // Mark this item as enhanced
+              item.setAttribute('data-enhanced', 'true');
+              
+              // Store the notification ID in a data attribute for easy access
+              item.dataset.notificationId = notification.id;
+              
+              // Get the main div element inside dd
+              const mainDiv = item.querySelector('div.css-1gx654b, div.css-1rrteue');
+              if (!mainDiv) continue;
+              
+              // Get target URL for this notification
+              const targetUrl = getNotificationTargetUrl(notification);
+              
+              if (targetUrl) {
+                // Set cursor to pointer only if we have a valid target
+                mainDiv.style.cursor = 'pointer';
                 
-                // Prevent default behavior
-                event.preventDefault();
-                
-                // Mark as read (non-blocking)
-                markAsRead(notification.id);
-                
-                // Navigate to target URL
-                window.location.href = targetUrl;
-              };
+                mainDiv.onclick = async function(event) {
+                  // Don't interfere with existing click behavior
+                  if (event.target.tagName === 'A' || event.target.closest('a')) {
+                    return;
+                  }
+                  
+                  // Prevent default behavior
+                  event.preventDefault();
+                  
+                  // Mark as read (non-blocking)
+                  markAsRead(notification.id);
+                  
+                  // Navigate to target URL
+                  window.location.href = targetUrl;
+                };
+              }
+            } else {
+              // Mark as enhanced even if no corresponding notification data
+              item.setAttribute('data-enhanced', 'true');
+              console.log(`No notification data for item at index ${itemIndex}`);
             }
           }
-        } else {
-          console.log('No notification data available - marking items as enhanced but keeping non-clickable');
-          // Mark items as enhanced even if no data, to avoid infinite retries
+          
+          console.log(`Enhanced ${unenhancedItems.length} items`);
+        } catch (error) {
+          console.log('Error fetching notifications:', error);
+          // Mark items as enhanced even if fetch failed to avoid infinite retries
           for (const item of unenhancedItems) {
             item.setAttribute('data-enhanced', 'true');
           }
+        } finally {
+          isFetching = false;
         }
       } catch (error) {
         console.log('Error enhancing alarm page:', error);
-        // Don't provide fallback navigation on error
+        isFetching = false;
       }
     }
   
